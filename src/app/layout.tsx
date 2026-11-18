@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono, Vazirmatn } from "next/font/google";
+import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
 
@@ -13,11 +13,10 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-const vazirmatn = Vazirmatn({
-  variable: "--font-vazir",
-  subsets: ["arabic"],
-  weight: ["400", "500", "600", "700", "800"],
-});
+// Vazirmatn is loaded via CDN at runtime (works everywhere, including Iran);
+// a system-font fallback stack is defined in globals.css.
+const VAZIRMATN_CDN =
+  "https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css";
 
 export const metadata: Metadata = {
   title: "کلاس‌میت | برگزاری کلاس آنلاین",
@@ -43,8 +42,12 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="fa" dir="rtl" className="dark" suppressHydrationWarning>
+      <head>
+        <link rel="preconnect" href="https://cdn.jsdelivr.net" crossOrigin="anonymous" />
+        <link rel="stylesheet" href={VAZIRMATN_CDN} />
+      </head>
       <body
-        className={`${vazirmatn.variable} ${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
+        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground`}
       >
         {children}
         <Toaster />

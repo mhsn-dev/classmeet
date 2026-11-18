@@ -162,7 +162,8 @@ export function MeetingRoom({ meeting, onLeave }: MeetingRoomProps) {
     person.isSelf ? meeting.localStream : meeting.getPeerStream(person.id)
 
   const copyInvite = async () => {
-    const link = `${window.location.origin}/#/room/${meeting.roomId}`
+    // pathname already includes the basePath on GitHub Pages deployments
+    const link = `${window.location.origin}${window.location.pathname}#/room/${meeting.roomId}`
     try {
       await navigator.clipboard.writeText(link)
       toast({ title: 'لینک دعوت کپی شد' })

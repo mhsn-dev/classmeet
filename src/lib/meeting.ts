@@ -1,13 +1,20 @@
 export const MAX_PARTICIPANTS = 18
 
 /**
- * Socket endpoint configuration.
- * - Sandbox/gateway: relative URL with XTransformPort (Caddy routes it).
- * - Production: set NEXT_PUBLIC_SIGNALING_URL='' (same origin) and
- *   NEXT_PUBLIC_SOCKET_PATH='/socket.io' behind a reverse proxy.
+ * Serverless signaling via Trystero (https://trystero.dev).
+ * Peer discovery happens over public relays (Nostr by default, MQTT as a
+ * fallback) — no backend is ever needed, so the app runs on GitHub Pages
+ * or any static file server with ~0 CPU/RAM usage. All media and data is
+ * peer-to-peer (WebRTC), end-to-end encrypted.
  */
-const SIGNALING_URL = process.env.NEXT_PUBLIC_SIGNALING_URL ?? '/?XTransformPort=3003'
-const SOCKET_PATH = process.env.NEXT_PUBLIC_SOCKET_PATH ?? '/'
+export const TRYSTERO_APP_ID = 'classmeet-turquoise-v1'
+
+export type SignalingStrategy = 'nostr' | 'mqtt'
+
+export const SIGNALING_STRATEGY_LABELS: Record<SignalingStrategy, string> = {
+  nostr: 'رله‌های عمومی Nostr (پیش‌فرض)',
+  mqtt: 'بروکر عمومی MQTT / EMQX',
+}
 
 export const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
@@ -15,19 +22,19 @@ export const RTC_CONFIG: RTCConfiguration = {
       urls: [
         'stun:stun.l.google.com:19302',
         'stun:stun1.l.google.com:19302',
+        'stun:stun.cloudflare.com:3478',
       ],
     },
   ],
   iceCandidatePoolSize: 4,
 }
 
-export function getSignalingUrl(): string {
-  return SIGNALING_URL
-}
-
-export function getSocketPath(): string {
-  return SOCKET_PATH
-}
+/** Free public TURN relays so peers behind strict NATs can still connect. */
+export const TURN_SERVERS = [
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+]
 
 const CODE_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789'
 
@@ -73,4 +80,26 @@ export const REACTION_META: Record<ReactionIcon, { iconKey: string; label: strin
   laugh: { iconKey: 'laugh', label: 'خنده' },
   lightbulb: { iconKey: 'lightbulb', label: 'ایده' },
   smile: { iconKey: 'smile', label: 'لبخند' },
+}
+
+const AVATAR_COLORS = [
+  '#2dd4bf', // turquoise
+  '#14b8a6', // teal
+  '#22c55e', // green
+  '#eab308', // yellow
+  '#f97316', // orange
+  '#ec4899', // pink
+  '#a855f7', // purple
+  '#06b6d4', // cyan
+  '#84cc16', // lime
+  '#f43f5e', // rose
+]
+
+/** Deterministic color for a peer id — every client derives the same color. */
+export function colorForId(id: string): string {
+  let hash = 0
+  for (let i = 0; i < id.length; i++) {
+    hash = (hash * 31 + id.charCodeAt(i)) | 0
+  }
+  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length]
 }

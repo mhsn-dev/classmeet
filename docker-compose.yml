@@ -1,39 +1,12 @@
 name: classmeet
 
+# Single tiny static web server — signaling is serverless (Trystero public
+# relays) and media is peer-to-peer, so this runs on ~0 CPU and few MB of RAM.
+# Perfect for a 2GB RAM / 1 CPU core VPS.
 services:
-  # Persian RTL web app (Next.js)
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    environment:
-      # Same-origin signaling behind the caddy reverse proxy
-      NEXT_PUBLIC_SIGNALING_URL: ""
-      NEXT_PUBLIC_SOCKET_PATH: "/socket.io"
-    restart: unless-stopped
-
-  # WebRTC signaling relay (socket.io)
-  signaling:
-    build:
-      context: ./mini-services/signaling
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    # No ports exposed to the host; caddy routes /socket.io internally
-
-  # Single entry point on port 80 (or set CLASSMEET_PORT)
-  caddy:
-    image: caddy:2-alpine
+  web:
+    build: .
     ports:
-      - "${CLASSMEET_PORT:-80}:80"
-    volumes:
-      - ./deploy/Caddyfile.prod:/etc/caddy/Caddyfile:ro
-    depends_on:
-      - app
-      - signaling
+      - "${CLASSMEET_PORT:-8080}:8080"
     restart: unless-stopped
-
-# Optional (recommended for users behind symmetric NAT):
-# run a lightweight coturn TURN server and add it to RTC_CONFIG in src/lib/meeting.ts
-# turn:
-#   image: coturn/coturn:alpine
-#   network_mode: host
+    mem_limit: 128m

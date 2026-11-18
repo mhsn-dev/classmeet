@@ -144,23 +144,17 @@ export function ControlBar({
         </ControlButton>
 
         <Popover open={reactionsOpen} onOpenChange={setReactionsOpen}>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <PopoverTrigger asChild>
-                <Button
-                  type="button"
-                  size="icon"
-                  aria-label="واکنش‌ها"
-                  className="size-12 rounded-full bg-white/10 text-teal-100 hover:bg-white/20 hover:scale-105"
-                >
-                  <Smile className="size-5" />
-                </Button>
-              </PopoverTrigger>
-            </TooltipTrigger>
-            <TooltipContent side="top" className="glass-strong border-white/10 text-xs">
-              واکنش‌ها
-            </TooltipContent>
-          </Tooltip>
+          <PopoverTrigger asChild>
+            <Button
+              type="button"
+              size="icon"
+              aria-label="واکنش‌ها"
+              title="واکنش‌ها"
+              className="size-12 rounded-full bg-white/10 text-teal-100 hover:bg-white/20 hover:scale-105"
+            >
+              <Smile className="size-5" />
+            </Button>
+          </PopoverTrigger>
           <PopoverContent
             side="top"
             align="center"

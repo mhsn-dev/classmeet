@@ -55,3 +55,11 @@ server.log
 # database files
 db/
 *.db
+
+# sandbox-only artifacts (not part of the app)
+dev.log
+tool-results/
+agent-ctx/
+/examples/
+/tests/
+/download/

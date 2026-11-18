@@ -1,33 +1,22 @@
 # syntax=docker/dockerfile:1
 
-# ---- ClassMeet web app (Next.js) ----
-FROM oven/bun:1.2 AS deps
-WORKDIR /app
-COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
+# ---- ClassMeet — fully static build ----
+# Signaling is serverless (Trystero over public relays) and all media flows
+# peer-to-peer, so the whole app is static files. This image runs comfortably
+# on a 2GB RAM / 1 CPU core VPS (nginx uses only a few MB).
 
 FROM oven/bun:1.2 AS builder
 WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
-RUN bun run build
+ENV STATIC_BUILD=1
+RUN bun run build:static
 
-FROM oven/bun:1.2-slim AS runner
-WORKDIR /app
-ENV NODE_ENV=production
-ENV NEXT_TELEMETRY_DISABLED=1
-ENV PORT=3000
-ENV HOSTNAME=0.0.0.0
-
-RUN addgroup --system --gid 1001 classmeet && \
-    adduser --system --uid 1001 classmeet
-
-COPY --from=builder --chown=classmeet:classmeet /app/.next/standalone ./
-COPY --from=builder --chown=classmeet:classmeet /app/.next/static ./.next/static
-COPY --from=builder --chown=classmeet:classmeet /app/public ./public
-
-USER classmeet
-EXPOSE 3000
-
-CMD ["bun", "server.js"]
+FROM nginx:1.27-alpine AS runner
+COPY --from=builder /app/out /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s CMD wget -qO- http://127.0.0.1:8080/ >/dev/null || exit 1
+CMD ["nginx", "-g", "daemon off;"]

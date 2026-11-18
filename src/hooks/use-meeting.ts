@@ -1,13 +1,18 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { io, Socket } from 'socket.io-client'
+import type { MessageAction, Room, UserState } from 'trystero'
 import { useToast } from '@/hooks/use-toast'
 import {
-  getSignalingUrl,
-  getSocketPath,
+  colorForId,
+  MAX_PARTICIPANTS,
+  normalizeRoomCode,
+  REACTION_ICONS,
   RTC_CONFIG,
+  TURN_SERVERS,
+  TRYSTERO_APP_ID,
   type ReactionIcon,
+  type SignalingStrategy,
 } from '@/lib/meeting'
 
 /* ------------------------------- types ------------------------------- */
@@ -51,25 +56,40 @@ interface JoinOptions {
   name: string
   micOn: boolean
   camOn: boolean
+  strategy?: SignalingStrategy
 }
 
-interface PeerCtx {
-  pc: RTCPeerConnection
-  makingOffer: boolean
-  ignoreOffer: boolean
-  hasRemoteDesc: boolean
-  queuedCandidates: RTCIceCandidateInit[]
-  videoSender: RTCRtpSender
-  restarted: boolean
+/** Signed per-user state that syncs automatically to late joiners. */
+interface ProfileState {
+  name: string
+  color: string
+  micOn: boolean
+  camOn: boolean
+  screenSharing: boolean
+  handRaised: boolean
+  joinedAt: number
 }
 
-interface SignalPayload {
-  from: string
-  data: { description?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }
+interface ChatPayload {
+  text: string
+  ts: number
 }
 
-const VIDEO_ENCODER_MAX_BITRATE = 260_000 // 260 kbps @ 360p15 — friendly for weak links
-const SCREEN_ENCODER_MAX_BITRATE = 500_000
+interface SysPayload {
+  t: 'kick' | 'mute-all'
+  target?: string
+}
+
+type StrategyModule = {
+  joinRoom: typeof import('trystero')['joinRoom']
+  getRelaySockets?: () => Record<string, WebSocket>
+}
+
+type JoinResult = { ok: boolean; reason?: string }
+
+const VIDEO_MAX_BITRATE = 260_000 // 260 kbps — friendly for weak links
+const SCREEN_MAX_BITRATE = 500_000
+const MAX_CHAT_LENGTH = 1200
 
 /* ------------------------------- hook ------------------------------- */
 
@@ -96,22 +116,33 @@ export function useMeeting() {
   const [socketConnected, setSocketConnected] = useState(false)
   const [startedAt, setStartedAt] = useState<number>(0)
 
-  const socketRef = useRef<Socket | null>(null)
-  const peersRef = useRef<Map<string, PeerCtx>>(new Map())
-  const streamsRef = useRef<Map<string, MediaStream>>(new Map())
+  const roomRef = useRef<Room | null>(null)
+  const moduleRef = useRef<StrategyModule | null>(null)
+  const profileRef = useRef<UserState<ProfileState> | null>(null)
+  const chatRef = useRef<MessageAction<ChatPayload> | null>(null)
+  const rxnRef = useRef<MessageAction<string> | null>(null)
+  const sysRef = useRef<MessageAction<SysPayload> | null>(null)
+  const unsubsRef = useRef<Array<() => void>>([])
+  const resolveJoinRef = useRef<((res: JoinResult) => void) | null>(null)
+  const selfInfoRef = useRef<{ peerId: string; userId: string } | null>(null)
+
+  const profilesRef = useRef<Map<string, ProfileState>>(new Map()) // userId → profile
+  const userIdByPeerRef = useRef<Map<string, string>>(new Map()) // peerId → userId
+  const connRef = useRef<Map<string, PeerConnectionStatus>>(new Map()) // peerId → status
+  const camStreamsRef = useRef<Map<string, MediaStream>>(new Map()) // peerId → camera stream
+  const screenStreamsRef = useRef<Map<string, MediaStream>>(new Map()) // peerId → screen stream
+
   const cameraStreamRef = useRef<MediaStream | null>(null)
   const screenStreamRef = useRef<MediaStream | null>(null)
   const cameraVideoTrackRef = useRef<MediaStreamTrack | null>(null)
   const micTrackRef = useRef<MediaStreamTrack | null>(null)
   const joinOptsRef = useRef<JoinOptions | null>(null)
-  const selfSeqRef = useRef<number>(0)
-  const selfIdRef = useRef<string>('')
   const joinedRef = useRef(false)
-  const rejoinNeededRef = useRef(false)
+  const selfJoinedAtRef = useRef<number>(Number.MAX_SAFE_INTEGER)
+
   const audioCtxRef = useRef<AudioContext | null>(null)
   const analysersRef = useRef<Map<string, { analyser: AnalyserNode; source: MediaStreamAudioSourceNode }>>(new Map())
   const speakerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const peerSeqCache = useRef<Map<string, number>>(new Map())
   const mediaVersionRef = useRef(0)
   const [, forceTick] = useState(0)
 
@@ -241,202 +272,217 @@ export function useMeeting() {
     setLocalStream(null)
   }, [])
 
-  /* --------------------------- peer connections --------------------------- */
+  /* ------------------------------ helpers ------------------------------ */
 
-  const applySenderCaps = useCallback((sender: RTCRtpSender, isScreen: boolean) => {
-    try {
-      const params = sender.getParameters()
-      if (!params.encodings || params.encodings.length === 0) {
-        params.encodings = [{}]
-      }
-      params.encodings[0].maxBitrate = isScreen ? SCREEN_ENCODER_MAX_BITRATE : VIDEO_ENCODER_MAX_BITRATE
-      params.encodings[0].maxFramerate = isScreen ? 10 : 15
-      try { params.degradationPreference = isScreen ? 'maintain-resolution' : 'balanced' } catch { /* optional */ }
-      void sender.setParameters(params).catch(() => { /* optional */ })
-    } catch { /* optional */ }
-  }, [])
-
-  const replaceVideoTrackOnAll = useCallback((track: MediaStreamTrack | null, isScreen: boolean) => {
-    if (track) {
-      try { track.contentHint = isScreen ? 'detail' : 'motion' } catch { /* noop */ }
-    }
-    for (const ctx of peersRef.current.values()) {
-      try {
-        void ctx.videoSender.replaceTrack(track)
-        applySenderCaps(ctx.videoSender, isScreen)
-      } catch { /* peer may be closing */ }
-    }
-  }, [applySenderCaps])
-
-  const handleRemoteTrack = useCallback((peerId: string, track: MediaStreamTrack) => {
-    let stream = streamsRef.current.get(peerId)
-    if (!stream) {
-      stream = new MediaStream()
-      streamsRef.current.set(peerId, stream)
-    }
-    const same = stream.getTracks().find((t) => t.kind === track.kind)
-    if (same && same.id !== track.id) stream.removeTrack(same)
-    if (!stream.getTracks().some((t) => t.id === track.id)) {
-      stream.addTrack(track)
-    }
-    attachAnalyser(peerId, stream)
-    bumpMedia()
-  }, [attachAnalyser, bumpMedia])
-
-  const emitSignal = useCallback((to: string, data: { description?: RTCSessionDescriptionInit; candidate?: RTCIceCandidateInit }) => {
-    socketRef.current?.emit('signal', { to, data })
+  const pushSystemMessage = useCallback((text: string) => {
+    setMessages((prev) => [
+      ...prev.slice(-200),
+      { id: `sys-${Date.now()}-${Math.random()}`, from: 'system', name: 'سیستم', color: '#94a3b8', text, ts: Date.now(), mine: false, kind: 'system' },
+    ])
   }, [])
 
   const getPeerStream = useCallback((id: string): MediaStream | null => {
-    return streamsRef.current.get(id) ?? null
+    return screenStreamsRef.current.get(id) ?? camStreamsRef.current.get(id) ?? null
   }, [])
 
-  const createPeer = useCallback((peerId: string, initiator: boolean): PeerCtx => {
-    const existing = peersRef.current.get(peerId)
-    if (existing) return existing
-
-    const pc = new RTCPeerConnection(RTC_CONFIG)
-    const ctx: PeerCtx = {
-      pc,
-      makingOffer: false,
-      ignoreOffer: false,
-      hasRemoteDesc: false,
-      queuedCandidates: [],
-      videoSender: null as unknown as RTCRtpSender,
-      restarted: false,
-    }
-
-    // Fixed, symmetric m-lines: audio + video sendrecv.
-    // This lets replaceTrack() swap camera/screen later with NO renegotiation.
-    const audioTr = pc.addTransceiver('audio', { direction: 'sendrecv' })
-    const videoTr = pc.addTransceiver('video', { direction: 'sendrecv' })
-    ctx.videoSender = videoTr.sender
-
-    const sharingNow = !!screenStreamRef.current
-    const audioTrack = micTrackRef.current
-    const videoTrack = sharingNow
-      ? screenStreamRef.current?.getVideoTracks()[0] ?? null
-      : cameraVideoTrackRef.current
-    if (audioTrack) void audioTr.sender.replaceTrack(audioTrack)
-    if (videoTrack) {
-      void videoTr.sender.replaceTrack(videoTrack)
-      applySenderCaps(videoTr.sender, sharingNow)
-    }
-
-    pc.onicecandidate = ({ candidate }) => {
-      if (candidate) emitSignal(peerId, { candidate: candidate.toJSON() })
-    }
-
-    pc.onnegotiationneeded = async () => {
-      try {
-        if (!initiator) return // only the newer participant offers
-        ctx.makingOffer = true
-        await pc.setLocalDescription()
-        if (pc.localDescription) emitSignal(peerId, { description: pc.localDescription })
-      } catch { /* noop */ } finally {
-        ctx.makingOffer = false
+  const isHostUser = useCallback((userId: string): boolean => {
+    // The host is the participant with the earliest join time (ties broken by userId).
+    let earliestUserId = selfInfoRef.current?.userId
+    let earliestTs = selfJoinedAtRef.current
+    for (const [uid, prof] of profilesRef.current) {
+      if (prof.joinedAt < earliestTs || (prof.joinedAt === earliestTs && uid < (earliestUserId ?? ''))) {
+        earliestTs = prof.joinedAt
+        earliestUserId = uid
       }
     }
+    return !!earliestUserId && earliestUserId === userId
+  }, [])
 
-    pc.ontrack = (ev) => handleRemoteTrack(peerId, ev.track)
+  const rebuildPeers = useCallback(() => {
+    const selfUserId = selfInfoRef.current?.userId
+    const selfPeerId = selfInfoRef.current?.peerId
 
-    pc.onconnectionstatechange = () => {
-      const state = pc.connectionState
-      setPeers((prev) => prev.map((p) => {
-        if (p.id !== peerId) return p
-        if (state === 'connected') return { ...p, connection: 'connected' }
-        if (state === 'disconnected') return { ...p, connection: 'reconnecting' }
-        if (state === 'failed') return { ...p, connection: 'failed' }
-        return p
-      }))
-      if (state === 'failed' && !ctx.restarted) {
-        ctx.restarted = true
-        try { pc.restartIce() } catch { /* noop */ }
+    const ordered: Array<{ peerId: string; userId: string }> = []
+    for (const [peerId, userId] of userIdByPeerRef.current) {
+      if (peerId !== selfPeerId) ordered.push({ peerId, userId })
+    }
+    if (selfPeerId && selfUserId) ordered.push({ peerId: selfPeerId, userId: selfUserId })
+    ordered.sort((a, b) => {
+      const ta = a.userId === selfUserId ? selfJoinedAtRef.current : profilesRef.current.get(a.userId)?.joinedAt ?? Number.MAX_SAFE_INTEGER
+      const tb = b.userId === selfUserId ? selfJoinedAtRef.current : profilesRef.current.get(b.userId)?.joinedAt ?? Number.MAX_SAFE_INTEGER
+      return ta - tb || a.peerId.localeCompare(b.peerId)
+    })
+
+    const nextPeers: Peer[] = []
+    let selfSeq = 0
+    ordered.forEach((entry, index) => {
+      const prof = profilesRef.current.get(entry.userId)
+      const isSelf = entry.peerId === selfPeerId
+      const peer: Peer = {
+        id: entry.peerId,
+        name: prof?.name ?? 'مهمان',
+        color: prof?.color ?? colorForId(entry.peerId),
+        seq: index,
+        micOn: prof?.micOn ?? true,
+        camOn: prof?.camOn ?? true,
+        screenSharing: prof?.screenSharing ?? false,
+        handRaised: prof?.handRaised ?? false,
+        isHost: index === 0,
+        connection: isSelf ? 'connected' : connRef.current.get(entry.peerId) ?? 'connecting',
       }
-    }
+      if (isSelf) {
+        selfSeq = index
+        setSelf((prev) => (prev ? { ...prev, seq: index, isHost: index === 0 } : prev))
+      } else {
+        nextPeers.push(peer)
+      }
+    })
+    if (!selfPeerId) setSelf((prev) => (prev ? { ...prev, isHost: false } : prev))
+    setPeers((prev) => {
+      const same =
+        prev.length === nextPeers.length &&
+        prev.every((p, i) => {
+          const q = nextPeers[i]
+          return p.id === q.id && p.name === q.name && p.color === q.color && p.seq === q.seq &&
+            p.micOn === q.micOn && p.camOn === q.camOn && p.screenSharing === q.screenSharing &&
+            p.handRaised === q.handRaised && p.isHost === q.isHost && p.connection === q.connection
+        })
+      return same ? prev : nextPeers
+    })
+    return selfSeq
+  }, [])
 
-    peersRef.current.set(peerId, ctx)
-    return ctx
-  }, [applySenderCaps, emitSignal, handleRemoteTrack])
+  /* --------------------------- peer lifecycle --------------------------- */
 
-  const destroyPeer = useCallback((peerId: string) => {
-    const ctx = peersRef.current.get(peerId)
-    if (ctx) {
-      try { ctx.pc.close() } catch { /* noop */ }
-      peersRef.current.delete(peerId)
-    }
-    streamsRef.current.delete(peerId)
+  const destroyPeer = useCallback((peerId: string, userId?: string) => {
+    connRef.current.delete(peerId)
+    userIdByPeerRef.current.delete(peerId)
+    camStreamsRef.current.delete(peerId)
+    screenStreamsRef.current.delete(peerId)
+    if (userId) profilesRef.current.delete(userId)
     const a = analysersRef.current.get(peerId)
     if (a) {
       try { a.source.disconnect() } catch { /* noop */ }
       analysersRef.current.delete(peerId)
     }
-    setPeers((prev) => prev.filter((p) => p.id !== peerId))
+    rebuildPeers()
     bumpMedia()
-  }, [bumpMedia])
+  }, [bumpMedia, rebuildPeers])
 
-  const handleSignal = useCallback(async (payload: SignalPayload) => {
-    const { from, data } = payload
-    if (!from || !data) return
+  const teardownRef = useRef<((silent: boolean) => void) | null>(null)
 
-    if (data.description) {
-      const desc = data.description
-      // Create the passive side on demand if the offer arrives before user-joined handling
-      const ctx = peersRef.current.get(from) ?? createPeer(from, false)
-      const pc = ctx.pc
-      const isInitiator = selfSeqRef.current > (peerSeqCache.current.get(from) ?? 0)
-      const polite = !isInitiator
-      const readyForOffer = !ctx.makingOffer && pc.signalingState === 'stable'
-      const collision = desc.type === 'offer' && !readyForOffer
-      ctx.ignoreOffer = !polite && collision
-      if (ctx.ignoreOffer) return
-
-      try {
-        await pc.setRemoteDescription(desc)
-        ctx.hasRemoteDesc = true
-        for (const c of ctx.queuedCandidates) {
-          try { await pc.addIceCandidate(c) } catch { /* noop */ }
+  /** Cap outgoing video bitrate so mesh calls stay usable on weak links. */
+  const applySenderCaps = useCallback(() => {
+    const room = roomRef.current
+    if (!room) return
+    try {
+      const peers = room.getPeers()
+      for (const info of Object.values(peers)) {
+        const pc = info.connection
+        if (!pc) continue
+        for (const sender of pc.getSenders()) {
+          const track = sender.track
+          if (!track || track.kind !== 'video') continue
+          const isScreen = track.contentHint === 'detail'
+          const params = sender.getParameters()
+          if (!params.encodings || params.encodings.length === 0) params.encodings = [{}]
+          params.encodings[0].maxBitrate = isScreen ? SCREEN_MAX_BITRATE : VIDEO_MAX_BITRATE
+          params.encodings[0].maxFramerate = isScreen ? 10 : 15
+          try { params.degradationPreference = isScreen ? 'maintain-resolution' : 'balanced' } catch { /* optional */ }
+          void sender.setParameters(params).catch(() => { /* optional */ })
         }
-        ctx.queuedCandidates = []
-        if (desc.type === 'offer') {
-          await pc.setLocalDescription()
-          if (pc.localDescription) emitSignal(from, { description: pc.localDescription })
-        }
-      } catch { /* ignore malformed signals */ }
-      return
-    }
-
-    if (data.candidate) {
-      const ctx = peersRef.current.get(from)
-      if (!ctx) return
-      try {
-        if (ctx.hasRemoteDesc && ctx.pc.remoteDescription) {
-          await ctx.pc.addIceCandidate(data.candidate)
-        } else {
-          ctx.queuedCandidates.push(data.candidate)
-        }
-      } catch (err) {
-        if (!ctx.ignoreOffer) console.debug('ice candidate error', err)
       }
-    }
-  }, [createPeer, emitSignal])
+    } catch { /* best effort */ }
+  }, [])
+
+  const wireRoom = useCallback((room: Room) => {
+    const unsubs = unsubsRef.current
+
+    unsubs.push(room.onUserJoin(({ peerId, userId }) => {
+      userIdByPeerRef.current.set(peerId, userId)
+      connRef.current.set(peerId, 'connecting')
+      // Send our camera stream to the newcomer (targeted, per Trystero docs).
+      const cam = cameraStreamRef.current
+      if (cam && cam.getTracks().length > 0) {
+        void room.addStream(cam, { target: userId, metadata: { kind: 'camera' } })
+      }
+      applySenderCaps()
+      rebuildPeers()
+    }))
+
+    unsubs.push(room.onUserLeave(({ peerId, userId }) => {
+      const name = profilesRef.current.get(userId)?.name
+      destroyPeer(peerId, userId)
+      pushSystemMessage(`${name ?? 'شرکت‌کننده'} جلسه را ترک کرد`)
+      toast({ title: `${name ?? 'شرکت‌کننده'} جلسه را ترک کرد` })
+    }))
+
+    unsubs.push(room.onPeerJoin(({ peerId }) => {
+      connRef.current.set(peerId, 'connected')
+      applySenderCaps()
+      rebuildPeers()
+      bumpMedia()
+    }))
+
+    unsubs.push(room.onPeerStream((stream, { peerId, userId, metadata }) => {
+      userIdByPeerRef.current.set(peerId, userId)
+      const kind = (metadata as { kind?: string } | undefined)?.kind
+      if (kind === 'screen') {
+        screenStreamsRef.current.set(peerId, stream)
+      } else {
+        camStreamsRef.current.set(peerId, stream)
+      }
+      attachAnalyser(peerId, stream)
+      rebuildPeers()
+      bumpMedia()
+    }, { replay: true }))
+
+    unsubs.push(room.onError((err) => {
+      if (err.code === 'room-full') {
+        resolveJoinRef.current?.({ ok: false, reason: 'room-full' })
+        teardownRef.current?.(true)
+        setPhase('error')
+        return
+      }
+      if (err.code === 'relay-failed') {
+        setSocketConnected(false)
+        return
+      }
+      if (err.code === 'peer-connect-failed' || err.code === 'peer-error' || err.code === 'handshake-failed') {
+        if (err.peerId) {
+          connRef.current.set(err.peerId, 'failed')
+          rebuildPeers()
+          bumpMedia()
+        }
+      }
+    }))
+  }, [applySenderCaps, attachAnalyser, bumpMedia, destroyPeer, pushSystemMessage, rebuildPeers, toast])
 
   /* ------------------------------ teardown ------------------------------ */
 
   const teardown = useCallback((silent: boolean) => {
     joinedRef.current = false
-    rejoinNeededRef.current = false
     joinOptsRef.current = null
-    try { socketRef.current?.emit('leave-room') } catch { /* noop */ }
-    socketRef.current?.disconnect()
-    socketRef.current = null
-    for (const id of Array.from(peersRef.current.keys())) {
-      const ctx = peersRef.current.get(id)
-      try { ctx?.pc.close() } catch { /* noop */ }
-      peersRef.current.delete(id)
+    for (const unsub of unsubsRef.current) {
+      try { unsub() } catch { /* noop */ }
     }
-    streamsRef.current.clear()
-    peerSeqCache.current.clear()
+    unsubsRef.current = []
+    try {
+      void roomRef.current?.leave().catch(() => { /* noop */ })
+    } catch { /* noop */ }
+    roomRef.current = null
+    moduleRef.current = null
+    profileRef.current = null
+    chatRef.current = null
+    rxnRef.current = null
+    sysRef.current = null
+    selfInfoRef.current = null
+    selfJoinedAtRef.current = Number.MAX_SAFE_INTEGER
+    profilesRef.current.clear()
+    userIdByPeerRef.current.clear()
+    connRef.current.clear()
+    camStreamsRef.current.clear()
+    screenStreamsRef.current.clear()
     screenStreamRef.current?.getTracks().forEach((t) => t.stop())
     screenStreamRef.current = null
     if (!silent) {
@@ -458,119 +504,17 @@ export function useMeeting() {
     if (!silent) setLocalStream(null)
   }, [stopSpeakerDetection])
 
-  /* --------------------------- socket wiring --------------------------- */
-
-  const pushSystemMessage = useCallback((text: string) => {
-    setMessages((prev) => [
-      ...prev.slice(-200),
-      { id: `sys-${Date.now()}-${Math.random()}`, from: 'system', name: 'سیستم', color: '#94a3b8', text, ts: Date.now(), mine: false, kind: 'system' },
-    ])
-  }, [])
-
-  const adoptExistingUser = useCallback((u: Peer) => {
-    peerSeqCache.current.set(u.id, u.seq)
-    setPeers((prev) => (prev.some((p) => p.id === u.id) ? prev : [...prev, { ...u, connection: 'connecting' }]))
-    // The newest participant (highest seq) initiates the offer
-    if (selfSeqRef.current > u.seq) createPeer(u.id, true)
-  }, [createPeer])
-
-  const wireSocket = useCallback((socket: Socket) => {
-    socket.on('connect', () => {
-      setSocketConnected(true)
-      // Auto re-join ONLY after a genuine disconnect (never on the initial connect)
-      if (rejoinNeededRef.current && joinOptsRef.current && socket.id !== selfIdRef.current) {
-        rejoinNeededRef.current = false
-        const opts = joinOptsRef.current
-        for (const id of Array.from(peersRef.current.keys())) destroyPeer(id)
-        socket.emit('join-room', {
-          roomId: opts.roomId,
-          name: opts.name,
-          micOn: micTrackRef.current?.enabled ?? opts.micOn,
-          camOn: cameraVideoTrackRef.current?.enabled ?? opts.camOn,
-        }, (res: unknown) => {
-          const ack = res as { ok: boolean; reason?: string; self?: Peer; users?: Peer[] }
-          if (!ack.ok) return
-          const sid = socket.id ?? ''
-          if (!sid) return
-          selfIdRef.current = sid
-          selfSeqRef.current = ack.self?.seq ?? 0
-          peerSeqCache.current.set(sid, selfSeqRef.current)
-          setSelf({ ...(ack.self ?? { id: sid, name: opts.name, color: '#2dd4bf', seq: 0, micOn: true, camOn: true, screenSharing: false, handRaised: false, isHost: false }), id: sid, connection: 'connected' })
-          joinedRef.current = true
-          for (const u of ack.users ?? []) adoptExistingUser(u)
-        })
-      }
-    })
-
-    socket.on('disconnect', () => {
-      setSocketConnected(false)
-      if (joinedRef.current) {
-        joinedRef.current = false
-        rejoinNeededRef.current = true
-        pushSystemMessage('اتصال دچار اختلال شد؛ در حال تلاش مجدد…')
-        // Peer connections are tied to the old socket id — tear them down.
-        for (const id of Array.from(peersRef.current.keys())) destroyPeer(id)
-      }
-    })
-
-    socket.on('signal', (payload: SignalPayload) => {
-      void handleSignal(payload)
-    })
-
-    socket.on('user-joined', ({ user }: { user: Peer }) => {
-      pushSystemMessage(`${user.name} به جلسه پیوست`)
-      toast({ title: `${user.name} به جلسه پیوست` })
-      adoptExistingUser(user)
-    })
-
-    socket.on('peer-left', ({ id, name }: { id: string; name: string }) => {
-      destroyPeer(id)
-      pushSystemMessage(`${name} جلسه را ترک کرد`)
-      toast({ title: `${name} جلسه را ترک کرد` })
-    })
-
-    socket.on('peer-state', ({ id, micOn: m, camOn: c, screenSharing: s }: { id: string; micOn: boolean; camOn: boolean; screenSharing: boolean }) => {
-      setPeers((prev) => prev.map((p) => (p.id === id ? { ...p, micOn: m, camOn: c, screenSharing: s } : p)))
-    })
-
-    socket.on('peer-hand', ({ id, handRaised: h }: { id: string; handRaised: boolean }) => {
-      setPeers((prev) => prev.map((p) => (p.id === id ? { ...p, handRaised: h } : p)))
-      if (h) toast({ title: 'دستی بالا رفت', description: 'در پنل شرکت‌کننده‌ها ببینید.' })
-    })
-
-    socket.on('chat-message', (msg: Omit<ChatMessage, 'mine' | 'kind'>) => {
-      setMessages((prev) => [...prev.slice(-200), { ...msg, mine: msg.from === selfIdRef.current, kind: 'chat' }])
-    })
-
-    socket.on('peer-reaction', ({ id, name, icon }: { id: string; name: string; icon: ReactionIcon }) => {
-      const key = `${id}-${Date.now()}-${Math.random()}`
-      setReactions((prev) => [...prev, { key, icon, name }])
-      setTimeout(() => setReactions((prev) => prev.filter((r) => r.key !== key)), 4200)
-    })
-
-    socket.on('host-changed', ({ id, name }: { id: string; name: string }) => {
-      setPeers((prev) => prev.map((p) => (p.id === id ? { ...p, isHost: true } : { ...p, isHost: false })))
-      setSelf((s) => (s && s.id === id ? { ...s, isHost: true } : s ? { ...s, isHost: false } : s))
-      toast({ title: `${name} میزبان جلسه شد` })
-    })
-
-    socket.on('force-mute', () => {
-      const track = micTrackRef.current
-      if (track) track.enabled = false
-      setMicOn(false)
-      toast({ title: 'میزبان صدای همه را قطع کرد', description: 'برای صحبت، میکروفون را دوباره فعال کنید.' })
-    })
-
-    socket.on('removed-by-host', () => {
-      setKicked(true)
-      teardown(true)
-      toast({ title: 'شما از جلسه اخراج شدید' })
-    })
-  }, [adoptExistingUser, destroyPeer, handleSignal, pushSystemMessage, teardown, toast])
+  useEffect(() => {
+    teardownRef.current = teardown
+  }, [teardown])
 
   /* ------------------------------- join ------------------------------- */
 
-  const joinRoom = useCallback(async (opts: JoinOptions): Promise<{ ok: boolean; reason?: string }> => {
+  const joinRoom = useCallback(async (opts: JoinOptions): Promise<JoinResult> => {
+    if (joinedRef.current) return { ok: true }
+    // Normalize once here so every entry point (create, join, deep link)
+    // maps to the exact same Trystero room topic.
+    opts = { ...opts, roomId: normalizeRoomCode(opts.roomId) }
     setPhase('joining')
     setKicked(false)
     joinOptsRef.current = opts
@@ -579,61 +523,187 @@ export function useMeeting() {
 
     await ensureLocalMedia(opts.camOn)
     const stream = cameraStreamRef.current
-    const micOk = !!micTrackRef.current
-    const camOk = !!cameraVideoTrackRef.current
     if (micTrackRef.current) micTrackRef.current.enabled = opts.micOn
     if (cameraVideoTrackRef.current) cameraVideoTrackRef.current.enabled = opts.camOn
 
-    if (!socketRef.current) {
-      socketRef.current = io(getSignalingUrl(), {
-        path: getSocketPath(),
-        transports: ['websocket', 'polling'],
-        forceNew: true,
-        reconnection: true,
-        reconnectionAttempts: Infinity,
-        reconnectionDelay: 1200,
-        reconnectionDelayMax: 6000,
-        timeout: 12000,
-      })
-      wireSocket(socketRef.current)
-    }
-    const socket = socketRef.current
-    if (!socket.connected) socket.connect()
-
-    return await new Promise<{ ok: boolean; reason?: string }>((resolve) => {
-      const timeout = setTimeout(() => {
-        resolve({ ok: false, reason: 'timeout' })
-      }, 15000)
-      socket.emit('join-room', {
-        roomId: opts.roomId,
-        name: opts.name,
-        micOn: opts.micOn && micOk,
-        camOn: opts.camOn && camOk,
-      }, (res: unknown) => {
-        const ack = res as { ok: boolean; reason?: string; self?: Peer; users?: Peer[] }
+    return await new Promise<JoinResult>((resolve) => {
+      let settled = false
+      const finish = (res: JoinResult) => {
+        if (settled) return
+        settled = true
         clearTimeout(timeout)
-        if (!ack.ok) {
-          teardown(false)
-          setPhase('error')
-          resolve({ ok: false, reason: ack.reason })
-          return
+        resolveJoinRef.current = null
+        resolve(res)
+      }
+      const timeout = setTimeout(() => {
+        teardown(false)
+        setPhase('error')
+        finish({ ok: false, reason: 'timeout' })
+      }, 20000)
+      resolveJoinRef.current = finish
+
+      void (async () => {
+        try {
+          const strategy: SignalingStrategy = opts.strategy ?? 'nostr'
+          const mod: StrategyModule = strategy === 'mqtt'
+            ? await import('@trystero-p2p/mqtt')
+            : await import('trystero')
+          if (settled) return
+          moduleRef.current = mod
+
+          const room = mod.joinRoom(
+            {
+              appId: TRYSTERO_APP_ID,
+              maxUsers: MAX_PARTICIPANTS,
+              identity: 'none', // fresh throwaway identity per tab
+              rtcConfig: RTC_CONFIG,
+              turnConfig: TURN_SERVERS,
+            },
+            opts.roomId,
+          )
+          roomRef.current = room
+          wireRoom(room)
+
+          const selfInfo = await room.getSelf()
+          if (settled) return
+          selfInfoRef.current = { peerId: selfInfo.peerId, userId: selfInfo.userId }
+
+          await room.ready
+          if (settled) return
+          setSocketConnected(true)
+
+          const joinedAt = Date.now()
+          selfJoinedAtRef.current = joinedAt
+          const myColor = colorForId(selfInfo.peerId)
+
+          const profile = room.makeUserState<ProfileState>('profile', {
+            name: opts.name,
+            color: myColor,
+            micOn: opts.micOn && !!micTrackRef.current,
+            camOn: opts.camOn && !!cameraVideoTrackRef.current,
+            screenSharing: false,
+            handRaised: false,
+            joinedAt,
+          })
+          profileRef.current = profile
+
+          unsubsRef.current.push(profile.onChange((value, ctx) => {
+            if (ctx.self) return
+            if (value === undefined || ctx.removed) {
+              rebuildPeers()
+              return
+            }
+            profilesRef.current.set(ctx.userId, value)
+            if (ctx.peerId) userIdByPeerRef.current.set(ctx.peerId, ctx.userId)
+            // If a peer stopped sharing their screen, drop the stale stream.
+            if (!value.screenSharing) {
+              for (const [pid, uid] of userIdByPeerRef.current) {
+                if (uid === ctx.userId && screenStreamsRef.current.has(pid)) {
+                  screenStreamsRef.current.delete(pid)
+                  bumpMedia()
+                }
+              }
+            }
+            rebuildPeers()
+          }, { replay: true }))
+
+          const chat = room.makeAction<ChatPayload>('chat')
+          const rxn = room.makeAction<string>('rxn')
+          const sys = room.makeAction<SysPayload>('sys')
+          chatRef.current = chat
+          rxnRef.current = rxn
+          sysRef.current = sys
+
+          unsubsRef.current.push(chat.onMessage((data, ctx) => {
+            const prof = profilesRef.current.get(ctx.userId)
+            setMessages((prev) => [
+              ...prev.slice(-200),
+              {
+                id: `${ctx.peerId}-${data.ts}-${Math.random()}`,
+                from: ctx.peerId,
+                name: prof?.name ?? 'مهمان',
+                color: prof?.color ?? colorForId(ctx.peerId),
+                text: data.text,
+                ts: data.ts,
+                mine: false,
+                kind: 'chat',
+              },
+            ])
+          }))
+
+          unsubsRef.current.push(rxn.onMessage((icon, ctx) => {
+            if (!REACTION_ICONS.includes(icon as ReactionIcon)) return
+            const key = `${ctx.peerId}-${Date.now()}-${Math.random()}`
+            setReactions((prev) => [
+              ...prev,
+              { key, icon: icon as ReactionIcon, name: profilesRef.current.get(ctx.userId)?.name ?? 'مهمان' },
+            ])
+            setTimeout(() => setReactions((prev) => prev.filter((r) => r.key !== key)), 4200)
+          }))
+
+          unsubsRef.current.push(sys.onMessage((payload, ctx) => {
+            if (!isHostUser(ctx.userId)) return
+            if (payload.t === 'kick' && payload.target === selfInfoRef.current?.userId) {
+              setKicked(true)
+              teardown(true)
+              toast({ title: 'شما از جلسه اخراج شدید' })
+              return
+            }
+            if (payload.t === 'mute-all') {
+              const track = micTrackRef.current
+              if (track) track.enabled = false
+              setMicOn(false)
+              void profileRef.current?.set((prev) => (prev ? { ...prev, micOn: false } : prev))
+              toast({ title: 'میزبان صدای همه را قطع کرد', description: 'برای صحبت، میکروفون را دوباره فعال کنید.' })
+            }
+          }))
+
+          // Publish presence + media.
+          void profile.set((prev) => prev ?? {
+            name: opts.name,
+            color: myColor,
+            micOn: opts.micOn && !!micTrackRef.current,
+            camOn: opts.camOn && !!cameraVideoTrackRef.current,
+            screenSharing: false,
+            handRaised: false,
+            joinedAt,
+          })
+
+          if (stream && stream.getTracks().length > 0) {
+            await room.addStream(stream, { metadata: { kind: 'camera' } })
+          }
+
+          setSelf({
+            id: selfInfo.peerId,
+            name: opts.name,
+            color: myColor,
+            seq: 0,
+            micOn: opts.micOn && !!micTrackRef.current,
+            camOn: opts.camOn && !!cameraVideoTrackRef.current,
+            screenSharing: false,
+            handRaised: false,
+            isHost: false,
+            connection: 'connected',
+          })
+          if (stream && stream.getAudioTracks().length > 0) {
+            attachAnalyser(selfInfo.peerId, stream)
+          }
+          setRoomId(opts.roomId)
+          setStartedAt(Date.now())
+          rebuildPeers()
+          pushSystemMessage('شما به جلسه پیوستید')
+          setPhase('joined')
+          finish({ ok: true })
+        } catch {
+          if (!settled) {
+            teardown(false)
+            setPhase('error')
+            finish({ ok: false, reason: 'timeout' })
+          }
         }
-        const sid = socket.id ?? ''
-        selfIdRef.current = sid
-        selfSeqRef.current = ack.self?.seq ?? 0
-        peerSeqCache.current.clear()
-        peerSeqCache.current.set(sid, selfSeqRef.current)
-        setSelf({ ...ack.self, id: sid, connection: 'connected' } as Peer)
-        for (const u of ack.users ?? []) adoptExistingUser(u)
-        if (stream) attachAnalyser(sid, stream)
-        joinedRef.current = true
-        setStartedAt(Date.now())
-        pushSystemMessage('شما به جلسه پیوستید')
-        setPhase('joined')
-        resolve({ ok: true })
-      })
+      })()
     })
-  }, [adoptExistingUser, attachAnalyser, ensureLocalMedia, pushSystemMessage, teardown, wireSocket])
+  }, [attachAnalyser, ensureLocalMedia, isHostUser, pushSystemMessage, rebuildPeers, teardown, toast, wireRoom])
 
   /* ------------------------------- leave ------------------------------- */
 
@@ -654,8 +724,8 @@ export function useMeeting() {
     const next = !track.enabled
     track.enabled = next
     setMicOn(next)
-    socketRef.current?.emit('media-state', { micOn: next, camOn, screenSharing })
-  }, [camOn, screenSharing, toast])
+    void profileRef.current?.set((prev) => (prev ? { ...prev, micOn: next } : prev))
+  }, [toast])
 
   const toggleCam = useCallback(() => {
     const track = cameraVideoTrackRef.current
@@ -666,17 +736,19 @@ export function useMeeting() {
     const next = !track.enabled
     track.enabled = next
     setCamOn(next)
-    socketRef.current?.emit('media-state', { micOn, camOn: next, screenSharing })
-  }, [micOn, screenSharing, toast])
+    void profileRef.current?.set((prev) => (prev ? { ...prev, camOn: next } : prev))
+  }, [toast])
 
   const stopScreenShare = useCallback(() => {
-    screenStreamRef.current?.getTracks().forEach((t) => t.stop())
+    const room = roomRef.current
+    const ss = screenStreamRef.current
+    if (room && ss) room.removeStream(ss)
+    ss?.getTracks().forEach((t) => t.stop())
     screenStreamRef.current = null
-    replaceVideoTrackOnAll(cameraVideoTrackRef.current, false)
     setLocalStream(cameraStreamRef.current)
     setScreenSharing(false)
-    socketRef.current?.emit('media-state', { micOn, camOn, screenSharing: false })
-  }, [camOn, micOn, replaceVideoTrackOnAll])
+    void profileRef.current?.set((prev) => (prev ? { ...prev, screenSharing: false } : prev))
+  }, [])
 
   const toggleScreenShare = useCallback(async () => {
     if (screenSharing) {
@@ -690,21 +762,23 @@ export function useMeeting() {
       })
       const screenTrack = display.getVideoTracks()[0]
       if (!screenTrack) return
+      try { screenTrack.contentHint = 'detail' } catch { /* optional */ }
       screenStreamRef.current = display
       screenTrack.addEventListener('ended', () => stopScreenShare())
-      replaceVideoTrackOnAll(screenTrack, true)
+      const room = roomRef.current
+      if (room) await room.addStream(display, { metadata: { kind: 'screen' } })
       setLocalStream(display)
       setScreenSharing(true)
-      socketRef.current?.emit('media-state', { micOn, camOn, screenSharing: true })
+      void profileRef.current?.set((prev) => (prev ? { ...prev, screenSharing: true } : prev))
     } catch {
       toast({ title: 'اشتراک صفحه لغو شد' })
     }
-  }, [camOn, micOn, stopScreenShare, screenSharing, replaceVideoTrackOnAll, toast])
+  }, [screenSharing, stopScreenShare, toast])
 
   const toggleHand = useCallback(() => {
     const next = !handRaised
     setHandRaised(next)
-    socketRef.current?.emit('raise-hand', { handRaised: next })
+    void profileRef.current?.set((prev) => (prev ? { ...prev, handRaised: next } : prev))
     toast({ title: next ? 'دست شما بالا رفت' : 'دست شما پایین آمد' })
   }, [handRaised, toast])
 
@@ -713,32 +787,45 @@ export function useMeeting() {
     const name = self?.name ?? 'شما'
     setReactions((prev) => [...prev, { key, icon, name }])
     setTimeout(() => setReactions((prev) => prev.filter((r) => r.key !== key)), 4200)
-    socketRef.current?.emit('reaction', { icon })
+    void rxnRef.current?.send(icon)
   }, [self?.name])
 
   const sendChat = useCallback((text: string) => {
-    const clean = text.trim()
+    const clean = text.trim().slice(0, MAX_CHAT_LENGTH)
     if (!clean) return
-    socketRef.current?.emit('chat-message', { text: clean })
-  }, [])
+    const ts = Date.now()
+    void chatRef.current?.send({ text: clean, ts })
+    setMessages((prev) => [
+      ...prev.slice(-200),
+      {
+        id: `self-${ts}-${Math.random()}`,
+        from: selfInfoRef.current?.peerId ?? 'self',
+        name: self?.name ?? 'شما',
+        color: self?.color ?? '#2dd4bf',
+        text: clean,
+        ts,
+        mine: true,
+        kind: 'chat',
+      },
+    ])
+  }, [self?.color, self?.name])
 
   /* ----------------------------- host actions ----------------------------- */
 
   const muteAll = useCallback(() => {
-    socketRef.current?.emit('host-mute-all', (res: unknown) => {
-      const ack = res as { ok: boolean; count?: number }
-      if (ack.ok) {
-        toast({ title: 'صدای همه قطع شد', description: `${ack.count ?? 0} نفر بی‌صدا شدند.` })
-      }
-    })
+    void sysRef.current?.send({ t: 'mute-all' })
+    toast({ title: 'درخواست قطع صدا ارسال شد', description: 'میکروفون همه شرکت‌کننده‌ها قطع می‌شود.' })
   }, [toast])
 
   const removePeer = useCallback((id: string) => {
-    socketRef.current?.emit('host-remove', { targetId: id }, (res: unknown) => {
-      const ack = res as { ok: boolean }
-      if (!ack.ok) toast({ title: 'فقط میزبان می‌تواند این کار را انجام دهد' })
-    })
-  }, [toast])
+    const userId = userIdByPeerRef.current.get(id)
+    if (!userId || !isHostUser(selfInfoRef.current?.userId ?? '')) {
+      toast({ title: 'فقط میزبان می‌تواند این کار را انجام دهد' })
+      return
+    }
+    void sysRef.current?.send({ t: 'kick', target: userId }, { target: userId })
+    toast({ title: 'شرکت‌کننده اخراج شد' })
+  }, [isHostUser, toast])
 
   /* ------------------------------ cleanup ------------------------------ */
 
@@ -746,6 +833,28 @@ export function useMeeting() {
     return () => {
       teardown(true)
     }
+  }, [])
+
+  // Graceful leave when the tab closes or the page is hidden.
+  useEffect(() => {
+    const onLeave = () => {
+      try { void roomRef.current?.leave() } catch { /* noop */ }
+    }
+    window.addEventListener('pagehide', onLeave)
+    return () => window.removeEventListener('pagehide', onLeave)
+  }, [])
+
+  // Poll relay sockets to reflect signaling connectivity in the UI.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (!joinedRef.current) return
+      const sockets = moduleRef.current?.getRelaySockets?.() ?? {}
+      const values = Object.values(sockets)
+      if (values.length === 0) return
+      const anyOpen = values.some((s) => s.readyState === 1)
+      setSocketConnected((prev) => (prev === anyOpen ? prev : anyOpen))
+    }, 4000)
+    return () => clearInterval(timer)
   }, [])
 
   return {

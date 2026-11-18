@@ -35,8 +35,11 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: 1
 
+      - name: Install signaling dependencies
+        run: cd mini-services/signaling && bun install --frozen-lockfile
+
       - name: Build signaling server check
-        run: bun build mini-services/signaling/index.ts --target=bun --outdir /tmp/signaling-check
+        run: cd mini-services/signaling && bun build index.ts --target=bun --outdir /tmp/signaling-check
 
   docker:
     name: Publish Docker images (GHCR)
